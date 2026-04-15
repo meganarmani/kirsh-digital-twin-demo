@@ -12,11 +12,93 @@ st.set_page_config(
 )
 
 DATA_DIR = Path("data/Tel_Aviv/digital_twin")
+FIELD_ID = "id"
 
 
 # ============================================================
-# LOAD
+# HELPERS
 # ============================================================
+
+def safe_values(df: pd.DataFrame, col: str) -> list[str]:
+    if col not in df.columns:
+        return []
+    return sorted(df[col].dropna().astype(str).unique().tolist())
+
+
+def safe_sum(df: pd.DataFrame, col: str) -> float:
+    if col not in df.columns:
+        return 0.0
+    return float(pd.to_numeric(df[col], errors="coerce").fillna(0).sum())
+
+
+def choose_metric_cols(df: pd.DataFrame) -> list[str]:
+    preferred = [
+        "ndvi_mean",
+        "ndre_mean",
+        "evi_mean",
+        "lai_mean",
+        "confidence_mean",
+        "margin_mean",
+    ]
+    return [c for c in preferred if c in df.columns]
+
+
+def crop_color(crop: str) -> list[int]:
+    crop = str(crop).lower()
+    if crop == "carrot":
+        return [255, 140, 0, 190]   # orange
+    if crop == "potato":
+        return [139, 69, 19, 190]   # brown
+    if crop == "wheat":
+        return [34, 139, 34, 190]   # green
+    return [160, 160, 160, 160]     # gray
+
+
+def health_color(label: str) -> list[int]:
+    label = str(label).lower()
+    if label == "strong":
+        return [46, 125, 50, 190]
+    if label == "moderate":
+        return [251, 192, 45, 190]
+    if label == "weak":
+        return [244, 124, 32, 190]
+    if label == "critical":
+        return [198, 40, 40, 190]
+    return [160, 160, 160, 160]
+
+
+def alert_color(label: str) -> list[int]:
+    label = str(label).lower()
+    if label == "normal":
+        return [76, 175, 80, 190]
+    if label == "watch":
+        return [255, 193, 7, 190]
+    if label == "moderate":
+        return [255, 112, 67, 190]
+    if label == "severe":
+        return [211, 47, 47, 190]
+    return [160, 160, 160, 160]
+
+
+def add_color_columns(df: pd.DataFrame, mode: str) -> pd.DataFrame:
+    out = df.copy()
+    
+    if mode == "Crop":
+        out["color"] = out["field_crop_final"].apply(crop_color)
+    elif mode == "Health":
+        if "health_label" in out.columns:
+            out["color"] = out["health_label"].apply(health_color)
+        else:
+            out["color"] = [[160, 160, 160, 160]] * len(out)
+    else:
+        if "alert_level" in out.columns:
+            out["color"] = out["alert_level"].apply(alert_color)
+        else:
+            out["color"] = [[160, 160, 160, 160]] * len(out)
+    
+    out[["r", "g", "b", "a"]] = pd.DataFrame(out["color"].tolist(), index=out.index)
+    return out
+
 
 @st.cache_data
 def load_all():
@@ -27,23 +109,31 @@ def load_all():
     field_changes = pd.read_parquet(DATA_DIR / "field_changes_latest.parquet")
     
     for df in [field_master, field_map, field_state, field_alerts, field_changes]:
-        for c in ["bin_start", "latest_bin_start", "previous_bin_start", "first_active_date", "peak_date", "last_active_date"]:
+        for c in [
+            "bin_start",
+            "latest_bin_start",
+            "previous_bin_start",
+            "first_active_date",
+            "peak_date",
+            "last_active_date",
+        ]:
             if c in df.columns:
                 df[c] = pd.to_datetime(df[c], errors="coerce")
     
     return field_master, field_map, field_state, field_alerts, field_changes
 
 
+# ============================================================
+# LOAD
+# ============================================================
+
 field_master, field_map, field_state, field_alerts, field_changes = load_all()
 
-FIELD_ID = "id"
-
-# Normalize IDs
 for df in [field_master, field_map, field_state, field_alerts, field_changes]:
     if FIELD_ID in df.columns:
         df[FIELD_ID] = df[FIELD_ID].astype(str)
 
-# Keep only classified/predicted fields on the map
+# Keep only fields that exist in field_master
 valid_ids = set(field_master[FIELD_ID].astype(str))
 field_map = field_map[field_map[FIELD_ID].astype(str).isin(valid_ids)].copy()
 
@@ -52,7 +142,7 @@ field_map["lon"] = pd.to_numeric(field_map["lon"], errors="coerce")
 field_map["lat"] = pd.to_numeric(field_map["lat"], errors="coerce")
 field_map = field_map.dropna(subset=["lon", "lat"]).copy()
 
-# merge field summary columns into map if missing
+# merge field summary into map if needed
 missing_master_cols = [c for c in field_master.columns if c not in field_map.columns]
 if missing_master_cols:
     field_map = field_map.merge(
@@ -63,75 +153,55 @@ if missing_master_cols:
 
 
 # ============================================================
-# STYLING
-# ============================================================
-
-CROP_COLORS = {
-    "wheat": [214, 174, 96, 190],
-    "potato": [140, 98, 57, 190],
-    "carrot": [230, 120, 40, 190],
-    "unknown": [140, 140, 140, 160],
-    "other": [200, 200, 200, 140],
-}
-
-ALERT_COLORS = {
-    "normal": [76, 175, 80, 190],
-    "watch": [255, 193, 7, 190],
-    "moderate": [255, 112, 67, 190],
-    "severe": [211, 47, 47, 190],
-    "unknown": [140, 140, 140, 160],
-}
-
-HEALTH_COLORS = {
-    "strong": [46, 125, 50, 190],
-    "moderate": [251, 192, 45, 190],
-    "weak": [244, 124, 32, 190],
-    "critical": [198, 40, 40, 190],
-    "unknown": [140, 140, 140, 160],
-}
-
-
-def add_color(df: pd.DataFrame, mode: str) -> pd.DataFrame:
-    out = df.copy()
-    
-    if mode == "Crop":
-        palette = CROP_COLORS
-        key = "field_crop_final"
-    elif mode == "Alert":
-        palette = ALERT_COLORS
-        key = "alert_level"
-    else:
-        palette = HEALTH_COLORS
-        key = "health_label"
-    
-    values = out[key].astype(str) if key in out.columns else pd.Series(["unknown"] * len(out), index=out.index)
-    colors = values.map(palette).apply(lambda x: x if isinstance(x, list) else [0, 200, 255, 180])
-    
-    out[["r", "g", "b", "a"]] = pd.DataFrame(colors.tolist(), index=out.index)
-    return out
-
-
-# ============================================================
 # SIDEBAR
 # ============================================================
 
 st.sidebar.title("Kirsh Digital Twin")
 st.sidebar.caption("Field intelligence workspace")
 
-crop_options = ["All"] + sorted(field_master["field_crop_final"].dropna().astype(str).unique().tolist())
-health_options = ["All"] + sorted(field_master["health_label"].dropna().astype(str).unique().tolist()) if "health_label" in field_master.columns else ["All"]
-alert_options = ["All"] + sorted(field_master["alert_level"].dropna().astype(str).unique().tolist()) if "alert_level" in field_master.columns else ["All"]
-season_options = ["All"] + sorted(field_state["season_year_inferred"].dropna().astype(str).unique().tolist()) if "season_year_inferred" in field_state.columns else ["All"]
-stage_options = ["All"] + sorted(field_state["stage_name"].dropna().astype(str).unique().tolist()) if "stage_name" in field_state.columns else ["All"]
+crop_filter = st.sidebar.selectbox(
+    "Crop",
+    ["All"] + safe_values(field_master, "field_crop_final"),
+    index=0,
+)
 
-crop_filter = st.sidebar.selectbox("Crop", crop_options, index=0)
-health_filter = st.sidebar.selectbox("Health", health_options, index=0)
-alert_filter = st.sidebar.selectbox("Alert", alert_options, index=0)
-season_filter = st.sidebar.selectbox("Season", season_options, index=0)
-stage_filter = st.sidebar.selectbox("Stage", stage_options, index=0)
+health_filter = st.sidebar.selectbox(
+    "Health",
+    ["All"] + safe_values(field_master, "health_label") if "health_label" in field_master.columns else ["All"],
+    index=0,
+)
+
+alert_filter = st.sidebar.selectbox(
+    "Alert",
+    ["All"] + safe_values(field_master, "alert_level") if "alert_level" in field_master.columns else ["All"],
+    index=0,
+)
+
+season_filter = st.sidebar.selectbox(
+    "Season",
+    ["All"] + safe_values(field_state, "season_year_inferred") if "season_year_inferred" in field_state.columns else ["All"],
+    index=0,
+)
+
+stage_filter = st.sidebar.selectbox(
+    "Stage",
+    ["All"] + safe_values(field_state, "stage_name") if "stage_name" in field_state.columns else ["All"],
+    index=0,
+)
+
 top_n = st.sidebar.slider("Top ranked fields", 10, 100, 25)
 
-# master filters
+st.sidebar.markdown(
+    """
+### Crop Legend
+- 🟧 Carrot 
+- 🟫 Potato 
+- 🟩 Wheat 
+- ⬜ Unknown
+"""
+)
+
+# Apply field-level filters
 master_f = field_master.copy()
 
 if crop_filter != "All":
@@ -167,11 +237,11 @@ st.caption("Crop classification, field health, alerts, and seasonal monitoring")
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("Fields", f"{len(master_f):,}")
 k2.metric("Alerts", f"{len(alerts_f):,}")
-k3.metric("Area (ha)", f"{field_master['area_ha_est'].fillna(0).sum():,.1f}" if "area_ha_est" in field_master.columns else "NA")
+k3.metric("Area (ha)", f"{safe_sum(master_f, 'area_ha_est'):,.1f}")
 k4.metric(
     "Weak / Review",
-    f"{int(((field_master['majority_ratio_known'].fillna(1) < 0.60) | (field_master['field_crop_prob_score'].fillna(1) < 0.60)).sum()):,}"
-    if {"majority_ratio_known", "field_crop_prob_score"}.issubset(field_master.columns) else "NA"
+    f"{int(((master_f['majority_ratio_known'].fillna(1) < 0.60) | (master_f['field_crop_prob_score'].fillna(1) < 0.60)).sum()):,}"
+    if {"majority_ratio_known", "field_crop_prob_score"}.issubset(master_f.columns) else "NA"
 )
 
 tabs = st.tabs([
@@ -208,8 +278,16 @@ with tabs[0]:
             y="n_fields",
             title="Fields by Crop",
             text_auto=True,
+            color="crop",
+            color_discrete_map={
+                "carrot": "#ff8c00",
+                "potato": "#8b4513",
+                "wheat": "#228b22",
+                "unknown": "#a0a0a0",
+                "other": "#c8c8c8",
+            },
         )
-        fig.update_layout(height=400)
+        fig.update_layout(height=400, showlegend=False)
         st.plotly_chart(fig, use_container_width=True)
     
     with b:
@@ -228,8 +306,9 @@ with tabs[0]:
                 y="n_fields",
                 title="Fields by Health",
                 text_auto=True,
+                color="health",
             )
-            fig.update_layout(height=400)
+            fig.update_layout(height=400, showlegend=False)
             st.plotly_chart(fig, use_container_width=True)
     
     c, d = st.columns(2)
@@ -246,8 +325,16 @@ with tabs[0]:
             y="area_ha_est",
             title="Area by Crop",
             text_auto=".1f",
+            color="field_crop_final",
+            color_discrete_map={
+                "carrot": "#ff8c00",
+                "potato": "#8b4513",
+                "wheat": "#228b22",
+                "unknown": "#a0a0a0",
+                "other": "#c8c8c8",
+            },
         )
-        fig.update_layout(height=400)
+        fig.update_layout(height=400, showlegend=False)
         st.plotly_chart(fig, use_container_width=True)
     
     with d:
@@ -266,15 +353,16 @@ with tabs[0]:
                 y="n_fields",
                 title="Alert Levels",
                 text_auto=True,
+                color="alert",
             )
-            fig.update_layout(height=400)
+            fig.update_layout(height=400, showlegend=False)
             st.plotly_chart(fig, use_container_width=True)
     
     st.subheader("Top Inspection Queue")
     queue = master_f.sort_values("inspection_rank") if "inspection_rank" in master_f.columns else master_f.copy()
     queue_cols = [
         c for c in [
-            FIELD_ID,
+            "id",
             "field_crop_final",
             "health_label",
             "alert_level",
@@ -299,7 +387,7 @@ with tabs[1]:
         st.warning("No map rows after filtering.")
     else:
         map_mode = st.radio("Map layer", ["Crop", "Health", "Alert"], horizontal=True)
-        map_plot = add_color(map_f, map_mode)
+        map_plot = add_color_columns(map_f, map_mode)
     
         layer = pdk.Layer(
             "ScatterplotLayer",
@@ -368,11 +456,7 @@ with tabs[2]:
                 if c in row.index:
                     st.write(f"**{c}**: {row.get(c)}")
     
-    metric_cols = [c for c in [
-        "ndvi_mean", "ndre_mean", "evi_mean", "lai_mean",
-        "confidence_mean", "margin_mean"
-    ] if c in one_state.columns]
-    
+    metric_cols = choose_metric_cols(one_state)
     if metric_cols and not one_state.empty:
         plot_df = one_state.melt(
             id_vars=[c for c in ["bin_start", "stage_name"] if c in one_state.columns],
@@ -397,9 +481,18 @@ with tabs[2]:
     st.markdown("### Recent Field Records")
     show_state_cols = [
         c for c in [
-            "bin_start", "season_year_inferred", "season_progress", "stage_name",
-            "ndvi_mean", "ndre_mean", "evi_mean", "lai_mean",
-            "confidence_mean", "margin_mean", "maturity_flag", "harvest_flag"
+            "bin_start",
+            "season_year_inferred",
+            "season_progress",
+            "stage_name",
+            "ndvi_mean",
+            "ndre_mean",
+            "evi_mean",
+            "lai_mean",
+            "confidence_mean",
+            "margin_mean",
+            "maturity_flag",
+            "harvest_flag",
         ] if c in one_state.columns
     ]
     st.dataframe(one_state[show_state_cols].head(50), use_container_width=True)
@@ -427,8 +520,9 @@ with tabs[3]:
             y="n_rows",
             title="Alert Records by Level",
             text_auto=True,
+            color="alert",
         )
-        fig.update_layout(height=360)
+        fig.update_layout(height=360, showlegend=False)
         st.plotly_chart(fig, use_container_width=True)
     
     st.dataframe(alerts_f.head(200), use_container_width=True)
@@ -448,6 +542,13 @@ with tabs[4]:
             y="ndvi_change",
             color="field_crop_final" if "field_crop_final" in changes_f.columns else None,
             title="Largest Recent NDVI Declines",
+            color_discrete_map={
+                "carrot": "#ff8c00",
+                "potato": "#8b4513",
+                "wheat": "#228b22",
+                "unknown": "#a0a0a0",
+                "other": "#c8c8c8",
+            },
         )
         fig.update_layout(height=420)
         st.plotly_chart(fig, use_container_width=True)
